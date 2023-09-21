@@ -38,6 +38,9 @@ deploy-redis-cached: clean ## Uses Redis to store counters, with an in-memory ca
 deploy-infinispan: clean ## Uses Infinispan to store counters
 	$(DOCKER_COMPOSE) -f docker-compose-envoy.yaml -f docker-compose-limitador-infinispan.yaml up
 
+deploy-infinispan-resp: clean ## Uses Infinispan RESP to store counters
+	$(DOCKER_COMPOSE) -f docker-compose-envoy.yaml -f docker-compose-limitador-infinispan-resp.yaml up
+
 ##@ Helper targets
 
 build: ## Build "limitador-testing" image
@@ -48,3 +51,4 @@ clean: ## clean all containers
 	- $(DOCKER_COMPOSE) -f docker-compose-envoy.yaml -f docker-compose-limitador-redis.yaml down --volumes --remove-orphans
 	- $(DOCKER_COMPOSE) -f docker-compose-envoy.yaml -f docker-compose-limitador-redis-cached.yaml down --volumes --remove-orphans
 	- $(DOCKER_COMPOSE) -f docker-compose-envoy.yaml -f docker-compose-limitador-infinispan.yaml down --volumes --remove-orphans
+	- $(DOCKER_COMPOSE) -f docker-compose-envoy.yaml -f docker-compose-limitador-infinispan-resp.yaml down --volumes --remove-orphans

@@ -1,0 +1,43 @@
+---
+version: '2.2'
+services:
+  limitador:
+    image: ${LIMITADOR_IMAGE:-limitador-testing}
+    depends_on:
+      envoy:
+        condition: service_started
+      infinispan:
+        condition: service_healthy
+    command:
+      - limitador-server
+      - --rls-ip
+      - 0.0.0.0
+      - --rls-port
+      - "8081"
+      - --http-ip
+      - 0.0.0.0
+      - --http-port
+      - "8080"
+      - -vvv
+      - /opt/kuadrant/limits/limits.yaml
+      - redis
+      - redis://infinispan:11222
+    expose:
+      - "8080"
+      - "8081"
+    ports:
+      - "18080:8080"
+    volumes:
+      - ./limits.yaml:/opt/kuadrant/limits/limits.yaml
+  infinispan:
+    image: quay.io/infinispan/server:14.0
+    command:
+      - -c
+      - /opt/infinispan/resp-config.xml
+    volumes: 
+      - ./infinispan-resp-config.xml:/opt/infinispan/resp-config.xml
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11222/rest/v2/cache-managers/default/health/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
