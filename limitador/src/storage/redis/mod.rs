@@ -6,6 +6,7 @@ mod counters_cache;
 mod redis_async;
 mod redis_cached;
 mod redis_sync;
+mod redis_hilo;
 mod scripts;
 
 pub const DEFAULT_FLUSHING_PERIOD_SEC: u64 = 1;
@@ -19,6 +20,7 @@ pub use redis_async::AsyncRedisStorage;
 pub use redis_cached::CachedRedisStorage;
 pub use redis_cached::CachedRedisStorageBuilder;
 pub use redis_sync::RedisStorage;
+pub use redis_hilo::RedisHiLoStorage;
 
 impl From<RedisError> for StorageErr {
     fn from(e: RedisError) -> Self {

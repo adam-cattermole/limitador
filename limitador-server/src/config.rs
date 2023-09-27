@@ -149,6 +149,7 @@ pub struct DiskStorageConfiguration {
 pub struct RedisStorageConfiguration {
     pub url: String,
     pub cache: Option<RedisStorageCacheConfiguration>,
+    pub hilo: bool,
 }
 
 #[derive(PartialEq, Eq, Debug)]

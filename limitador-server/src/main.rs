@@ -22,11 +22,11 @@ use limitador::storage::disk::DiskStorage;
 #[cfg(feature = "infinispan")]
 use limitador::storage::infinispan::{Consistency, InfinispanStorageBuilder};
 use limitador::storage::redis::{
-    AsyncRedisStorage, CachedRedisStorage, CachedRedisStorageBuilder, DEFAULT_FLUSHING_PERIOD_SEC,
+    AsyncRedisStorage, CachedRedisStorage, CachedRedisStorageBuilder, RedisHiLoStorage, DEFAULT_FLUSHING_PERIOD_SEC,
     DEFAULT_MAX_CACHED_COUNTERS, DEFAULT_MAX_TTL_CACHED_COUNTERS_SEC,
     DEFAULT_TTL_RATIO_CACHED_COUNTERS,
 };
-use limitador::storage::{AsyncCounterStorage, AsyncStorage, Storage};
+use limitador::storage::{AsyncCounterStorage, AsyncStorage, CounterStorage, Storage};
 use limitador::{
     storage, AsyncRateLimiter, AsyncRateLimiterBuilder, RateLimiter, RateLimiterBuilder,
 };
@@ -94,14 +94,25 @@ impl Limiter {
     }
 
     async fn redis_limiter(cfg: RedisStorageConfiguration, limit_name_labels: bool) -> Self {
-        let storage = Self::storage_using_redis(cfg).await;
-        let mut rate_limiter_builder = AsyncRateLimiterBuilder::new(storage);
+        if cfg.hilo {
+            let hilo_storage = Self::storage_using_hilo_redis(&cfg.url).await;
+            let counters: Box<dyn CounterStorage> = Box::new(hilo_storage);
+            let storage = Storage::with_counter_storage(counters);
+            let mut rate_limiter_builder = RateLimiterBuilder::with_storage(storage);
+            if limit_name_labels {
+                rate_limiter_builder = rate_limiter_builder.with_prometheus_limit_name_labels()
+            }
+            Self::Blocking(rate_limiter_builder.build())
+        } else {
+            let storage = Self::storage_using_redis(cfg).await;
+            let mut rate_limiter_builder = AsyncRateLimiterBuilder::new(storage);
 
-        if limit_name_labels {
-            rate_limiter_builder = rate_limiter_builder.with_prometheus_limit_name_labels()
+            if limit_name_labels {
+                rate_limiter_builder = rate_limiter_builder.with_prometheus_limit_name_labels()
+            }
+
+            Self::Async(rate_limiter_builder.build())
         }
-
-        Self::Async(rate_limiter_builder.build())
     }
 
     async fn storage_using_redis(cfg: RedisStorageConfiguration) -> AsyncStorage {
@@ -116,6 +127,16 @@ impl Limiter {
 
     async fn storage_using_async_redis(redis_url: &str) -> AsyncRedisStorage {
         match AsyncRedisStorage::new(redis_url).await {
+            Ok(storage) => storage,
+            Err(err) => {
+                eprintln!("Failed to connect to Redis at {redis_url}: {err}");
+                process::exit(1)
+            }
+        }
+    }
+
+    async fn storage_using_hilo_redis(redis_url: &str) -> RedisHiLoStorage {
+        match RedisHiLoStorage::new(redis_url) {
             Ok(storage) => storage,
             Err(err) => {
                 eprintln!("Failed to connect to Redis at {redis_url}: {err}");
@@ -557,7 +578,7 @@ fn create_config() -> (Configuration, &'static str) {
             Command::new("redis_cached")
                 .about("Uses Redis to store counters, with an in-memory cache")
                 .display_order(4)
-                .arg(redis_url_arg)
+                .arg(redis_url_arg.clone())
                 .arg(
                     Arg::new("TTL")
                         .long("ttl")
@@ -601,14 +622,20 @@ fn create_config() -> (Configuration, &'static str) {
                         .default_value("10000")
                         .display_order(5)
                         .help("Maximum amount of counters cached"),
-                ),
+                )
+        )
+        .subcommand(
+            Command::new("redis_hilo")
+                .display_order(5)
+                .about("Uses Redis to store counters")
+                .arg(redis_url_arg),
         );
 
     #[cfg(feature = "infinispan")]
     let cmdline = cmdline.subcommand(
         Command::new("infinispan")
             .about("Uses Infinispan to store counters")
-            .display_order(5)
+            .display_order(6)
             .arg(
                 Arg::new("URL")
                     .help("Infinispan URL to use")
@@ -683,6 +710,7 @@ fn create_config() -> (Configuration, &'static str) {
         Some(("redis", sub)) => StorageConfiguration::Redis(RedisStorageConfiguration {
             url: sub.get_one::<String>("URL").unwrap().to_owned(),
             cache: None,
+            hilo: false,
         }),
         Some(("disk", sub)) => StorageConfiguration::Disk(DiskStorageConfiguration {
             path: sub
@@ -703,6 +731,12 @@ fn create_config() -> (Configuration, &'static str) {
                 ttl_ratio: *sub.get_one("ratio").unwrap(),
                 max_counters: *sub.get_one("max").unwrap(),
             }),
+            hilo: false,
+        }),
+        Some(("redis_hilo", sub)) => StorageConfiguration::Redis(RedisStorageConfiguration {
+            url: sub.get_one::<String>("URL").unwrap().to_owned(),
+            cache: None,
+            hilo: true,
         }),
         #[cfg(feature = "infinispan")]
         Some(("infinispan", sub)) => {
@@ -792,6 +826,7 @@ fn storage_config_from_env() -> Result<StorageConfiguration, ()> {
             } else {
                 None
             },
+            hilo: false
         })),
         #[cfg(feature = "infinispan")]
         (Err(_), Ok(url)) => Ok(StorageConfiguration::Infinispan(
