@@ -48,6 +48,7 @@ sysinfo = "0.30.10"
 openssl = { version = "0.10.57", features = ["vendored"] }
 metrics = "0.22.3"
 metrics-exporter-prometheus = "0.14.0"
+base64 = { version = "0.22.1", features = ["std"] }
 
 
 [build-dependencies]

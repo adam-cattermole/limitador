@@ -1595,6 +1595,7 @@ version = "1.4.0-dev"
 dependencies = [
  "actix-rt",
  "actix-web",
+ "base64 0.22.1",
  "clap",
  "const_format",
  "lazy_static",

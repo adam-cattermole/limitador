@@ -14,6 +14,9 @@ use crate::config::{
 use crate::envoy_rls::server::{run_envoy_rls_server, RateLimitHeaders};
 use crate::http_api::server::run_http_server;
 use crate::metrics::MetricsLayer;
+use base64::prelude::BASE64_URL_SAFE;
+use base64::Engine;
+use clap::builder::TypedValueParser;
 use clap::{value_parser, Arg, ArgAction, Command};
 use const_format::formatcp;
 use limitador::counter::Counter;
@@ -40,6 +43,7 @@ use prometheus_metrics::PrometheusMetrics;
 use std::fmt::Display;
 use std::fs;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{env, process};
@@ -47,14 +51,18 @@ use tracing_subscriber::Layer;
 
 #[cfg(feature = "distributed_storage")]
 use clap::parser::ValuesRef;
+use header::AUTHORIZATION;
 
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use thiserror::Error;
 use tokio::runtime::Handle;
+use tonic::codegen::http::header;
+use tonic::metadata::{MetadataMap, MetadataValue};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use url::Url;
 
 mod envoy_rls;
 mod http_api;
@@ -216,18 +224,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = {
         let (config, version) = create_config();
         println!("{LIMITADOR_HEADER} {version}");
+
         let level = config.log_level.unwrap_or_else(|| {
             tracing_subscriber::filter::EnvFilter::from_default_env()
                 .max_level_hint()
                 .unwrap_or(LevelFilter::ERROR)
         });
-        let fmt_layer = if level >= LevelFilter::DEBUG {
-            tracing_subscriber::fmt::layer()
-                .with_span_events(FmtSpan::CLOSE)
-                .with_filter(level)
-        } else {
-            tracing_subscriber::fmt::layer().with_filter(level)
-        };
+
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_span_events(if level >= LevelFilter::DEBUG {
+                FmtSpan::CLOSE
+            } else {
+                FmtSpan::NONE
+            })
+            .with_filter(level);
 
         let metrics_layer = MetricsLayer::new()
             .gather(
@@ -243,26 +253,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if !config.tracing_endpoint.is_empty() {
             global::set_text_map_propagator(TraceContextPropagator::new());
+
+            let mut otlp_exporter = opentelemetry_otlp::new_exporter()
+                .tonic()
+                .with_endpoint(config.tracing_endpoint.clone());
+            // Add auth header if present
+            if !config.tracing_auth_header.is_empty() {
+                let mut map = MetadataMap::with_capacity(1);
+                map.insert(
+                    AUTHORIZATION.as_str(),
+                    config
+                        .tracing_auth_header
+                        .parse()
+                        .expect("failed to parse tracing auth header into ascii"),
+                );
+                otlp_exporter = otlp_exporter.with_metadata(map);
+            }
+
             let tracer = opentelemetry_otlp::new_pipeline()
                 .tracing()
-                .with_exporter(
-                    opentelemetry_otlp::new_exporter()
-                        .tonic()
-                        .with_endpoint(config.tracing_endpoint.clone()),
-                )
+                .with_exporter(otlp_exporter)
                 .with_trace_config(trace::config().with_resource(Resource::new(vec![
                     KeyValue::new("service.name", "limitador"),
                 ])))
                 .install_batch(opentelemetry_sdk::runtime::Tokio)?;
-            let tracing_level = level.max(LevelFilter::INFO);
+
             let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+            // Init tracing subscriber with telemetry
             tracing_subscriber::registry()
                 .with(metrics_layer)
                 .with(fmt_layer)
-                .with(tracing_level)
+                .with(level.max(LevelFilter::INFO))
                 .with(telemetry_layer)
                 .init();
         } else {
+            // Init tracing subscriber without telemetry
             tracing_subscriber::registry()
                 .with(metrics_layer)
                 .with(fmt_layer)
@@ -478,25 +504,32 @@ fn create_config() -> (Configuration, &'static str) {
                 .help("The host for the tracing service"),
         )
         .arg(
+            Arg::new("tracing_insecure")
+                .long("tracing-insecure")
+                .action(ArgAction::SetTrue)
+                .display_order(7)
+                .help("The host for the tracing service"),
+        )
+        .arg(
             Arg::new("v")
                 .short('v')
                 .action(ArgAction::Count)
                 .value_parser(value_parser!(u8).range(..5))
-                .display_order(7)
+                .display_order(8)
                 .help("Sets the level of verbosity"),
         )
         .arg(
             Arg::new("validate")
                 .long("validate")
                 .action(ArgAction::SetTrue)
-                .display_order(8)
+                .display_order(9)
                 .help("Validates the LIMITS_FILE and exits"),
         )
         .arg(
             Arg::new("rate_limit_headers")
                 .long("rate-limit-headers")
                 .short('H')
-                .display_order(9)
+                .display_order(10)
                 .default_value(config::env::RATE_LIMIT_HEADERS.unwrap_or("NONE"))
                 .value_parser(clap::builder::PossibleValuesParser::new([
                     "NONE",
@@ -508,7 +541,7 @@ fn create_config() -> (Configuration, &'static str) {
             Arg::new("grpc_reflection_service")
                 .long("grpc-reflection-service")
                 .action(ArgAction::SetTrue)
-                .display_order(10)
+                .display_order(11)
                 .help("Enables gRPC server reflection service"),
         )
         .subcommand(
@@ -727,6 +760,34 @@ fn create_config() -> (Configuration, &'static str) {
         _ => unreachable!("invalid --rate-limit-headers value"),
     };
 
+    let tracing_endpoint = matches
+        .get_one::<String>("tracing_endpoint")
+        .expect("tracing_endpoint provided or default");
+
+    let tracing_auth_header =
+        if !matches.get_flag("tracing_insecure") && !tracing_endpoint.is_empty() {
+            match Url::parse(tracing_endpoint) {
+                Ok(tracing_url) => {
+                    if let Some(password) = tracing_url.password() {
+                        let username = tracing_url.username();
+                        if username.is_empty() {
+                            format!("Bearer {}", password)
+                        } else {
+                            format!(
+                                "Basic {}",
+                                BASE64_URL_SAFE.encode(format!("{}:{}", username, password))
+                            )
+                        }
+                    } else {
+                        "".to_string()
+                    }
+                }
+                Err(_) => "".to_string(),
+            }
+        } else {
+            "".to_string()
+        };
+
     let mut config = Configuration::with(
         storage,
         limits_file.to_string(),
@@ -735,10 +796,8 @@ fn create_config() -> (Configuration, &'static str) {
         matches.get_one::<String>("http_ip").unwrap().into(),
         *matches.get_one::<u16>("http_port").unwrap(),
         matches.get_flag("limit_name_in_labels") || *config::env::LIMIT_NAME_IN_PROMETHEUS_LABELS,
-        matches
-            .get_one::<String>("tracing_endpoint")
-            .unwrap()
-            .into(),
+        tracing_endpoint.into(),
+        tracing_auth_header,
         rate_limit_headers,
         matches.get_flag("grpc_reflection_service"),
     );
